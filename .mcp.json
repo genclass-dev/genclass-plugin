@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "genclass": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "@genclass/mcp@0.2.1"
+      ]
+    }
+  }
+}

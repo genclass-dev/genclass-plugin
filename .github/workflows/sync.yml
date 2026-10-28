@@ -1,0 +1,36 @@
+# Keeps this repository equal to what packages/mcp/scripts/plugin-repo.mjs in genclass-dev/GenClass-lib assembles.
+# Nothing here is edited by hand: this workflow overwrites everything but .git and .github (the default token cannot
+# change workflow files, so this file is updated from GenClass-lib by a person).
+name: Sync from GenClass-lib
+on:
+  schedule:
+    - cron: "23 6 * * *"
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: genclass-dev/GenClass-lib
+          ref: main
+          path: lib
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Assemble from GenClass-lib
+        run: |
+          SHA=$(git -C lib rev-parse --short HEAD)
+          node lib/packages/mcp/scripts/plugin-repo.mjs out
+          rsync -a --delete --exclude .git --exclude .github --exclude lib --exclude out out/ ./
+          rm -rf lib out
+          echo "SHA=$SHA" >> "$GITHUB_ENV"
+      - name: Commit and push when something changed
+        run: |
+          git add -A
+          if git diff --cached --quiet; then echo "nothing changed"; exit 0; fi
+          git -c user.name=genclass-sync -c user.email=noreply@genclass.dev commit -m "sync from GenClass-lib $SHA"
+          git push

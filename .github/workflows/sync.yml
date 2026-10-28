@@ -1,6 +1,8 @@
-# Keeps this repository equal to what packages/mcp/scripts/plugin-repo.mjs in genclass-dev/GenClass-lib assembles.
-# Nothing here is edited by hand: this workflow overwrites everything but .git and .github (the default token cannot
-# change workflow files, so this file is updated from GenClass-lib by a person).
+# Keeps this repository equal to what packages/mcp/scripts/plugin-repo.mjs in genclass-dev/GenClass-lib assembles
+# (that script fetches the released server from npm and vendors it under server/). Nothing here is edited by hand:
+# this workflow overwrites everything but .git and .github (the default token cannot change workflow files, so this
+# file is updated from GenClass-lib by a person). Exit code 3 from the script means GenClass-lib's version is not on
+# npm yet (between a bump and its release): the repository then stays as it is.
 name: Sync from GenClass-lib
 on:
   schedule:
@@ -24,9 +26,11 @@ jobs:
       - name: Assemble from GenClass-lib
         run: |
           SHA=$(git -C lib rev-parse --short HEAD)
-          node lib/packages/mcp/scripts/plugin-repo.mjs out
-          rsync -a --delete --exclude .git --exclude .github --exclude lib --exclude out out/ ./
+          rc=0; node lib/packages/mcp/scripts/plugin-repo.mjs out || rc=$?
+          if [ "$rc" = 0 ]; then rsync -a --delete --exclude .git --exclude .github --exclude lib --exclude out out/ ./; fi
           rm -rf lib out
+          if [ "$rc" = 3 ]; then echo "GenClass-lib's version is not on npm yet: nothing to do until the release"; exit 0; fi
+          [ "$rc" = 0 ] || exit "$rc"
           echo "SHA=$SHA" >> "$GITHUB_ENV"
       - name: Commit and push when something changed
         run: |

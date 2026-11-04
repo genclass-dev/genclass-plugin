@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Vendored from @genclass/mcp@0.2.1 by packages/mcp/scripts/plugin-repo.mjs in genclass-dev/GenClass-lib: cli.mjs next
+// Vendored from @genclass/mcp@0.2.1 by packages/mcp/scripts/plugin-repo.mjs in genclass-dev/GenClass: cli.mjs next
 // to this file is that package's dist/cli.js, byte for byte, and this file is its bin/genclass-mcp.mjs importing it.
 // genclass-mcp: the GenClass MCP server and its helper commands (see src/cli.ts).
 import { runCli } from "./cli.mjs";

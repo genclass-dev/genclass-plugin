@@ -11,8 +11,12 @@ import { spawn } from 'child_process';
 // src/clients.ts
 var PACKAGE = "@genclass/mcp";
 var NAME = "genclass";
+var RUNTIME_VERSION = "0.3.0-beta.5";
 function pinned(version) {
   return `${PACKAGE}@${version}`;
+}
+function pinnedRuntime() {
+  return `@genclass/runtime@${RUNTIME_VERSION}`;
 }
 function serverConfig(version) {
   return { command: "npx", args: ["-y", pinned(version)] };
@@ -51,11 +55,11 @@ var CLIENTS = [
     match: /^claude-code$/i,
     block: (v) => [
       "As a plugin (the server, a prompt hook that brings new findings to each prompt, and the `genclass` skill with the procedure):",
-      fence("", "/plugin marketplace add genclass-dev/GenClass-lib\n/plugin install genclass@genclass"),
+      fence("", "/plugin marketplace add genclass-dev/genclass-plugin\n/plugin install genclass@genclass"),
       "Or the server alone (`--scope project` writes `.mcp.json` for everyone on the project; `--scope user` for all your projects). `init` also writes the skill to `.claude/skills/genclass/SKILL.md` (`--no-skill` leaves it out):",
       fence("bash", `claude mcp add --scope project ${NAME} -- npx -y ${pinned(v)}
 # or: npx -y ${pinned(v)} init --hook   (.mcp.json and the skill, plus the prompt hook in .claude/settings.json)`),
-      "Or just the skill (no server; `skills/genclass/SKILL.md` at the repository root, for skill directories): `npx skills add genclass-dev/GenClass-lib`"
+      "Or just the skill (no server): `npx skills add genclass-dev/genclass-plugin`. (`genclass-dev/genclass-plugin` is this plugin at a repository root, assembled from this package; the marketplace in `genclass-dev/GenClass` lists the same plugin.)"
     ].join("\n\n")
   },
   {
@@ -93,6 +97,9 @@ var CLIENTS = [
     label: "Codex CLI",
     match: /codex/i,
     block: (v) => [
+      "As a plugin (the server and the `genclass` skill):",
+      fence("bash", "codex plugin marketplace add genclass-dev/genclass-plugin\ncodex plugin add genclass@genclass"),
+      "Or the server alone:",
       fence("bash", `codex mcp add ${NAME} -- npx -y ${pinned(v)}`),
       "Or `~/.codex/config.toml` (`.codex/config.toml` in a trusted project). The first start downloads the package, so allow more than the default 10 seconds:",
       fence("toml", `[mcp_servers.${NAME}]
@@ -106,6 +113,9 @@ startup_timeout_sec = 30`)
     label: "Gemini CLI",
     match: /gemini/i,
     block: (v) => [
+      "As an extension (the server and the `genclass` skill):",
+      fence("bash", "gemini extensions install https://github.com/genclass-dev/genclass-plugin"),
+      "Or the server alone:",
       fence("bash", `gemini mcp add ${NAME} npx -- -y ${pinned(v)}   # -s user: for all projects`),
       "Or `.gemini/settings.json` in the project (`~/.gemini/settings.json` for all projects):",
       fence("json", mcpServers(v))
@@ -194,7 +204,7 @@ var DEFAULT_PORT = 47357;
 
 // src/http.ts
 var MAX_BODY = 1024 * 1024;
-var VERSION = "0.2.1";
+var VERSION = "0.2.2";
 function devOrigin(origin2, allow) {
   if (!origin2 || origin2 === "null") return false;
   let u;
@@ -421,14 +431,79 @@ function pathShape(path) {
 function shape(s) {
   return s.replace(/"[^"]*"|'[^']*'/g, "\u2026").replace(/\b\d+(\.\d+)?\b/g, "N").replace(/\s+/g, " ").trim().slice(0, 160);
 }
+function routeIdLike(seg) {
+  if (pathShape(seg) === "*") return true;
+  return seg.length >= 12 && /^[\w-]+$/.test(seg) && (seg.match(/[A-Z]/g)?.length ?? 0) >= 4 && (seg.match(/[a-z]/g)?.length ?? 0) >= 4;
+}
+function routeShape(route) {
+  return route.split("/").map((seg) => seg && routeIdLike(seg) ? "*" : seg).join("/");
+}
+var UUID = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi;
+function fieldShape(name) {
+  const s = name.replace(UUID, "*").replace(/:[rR][0-9a-zA-Z]*:|«[rR][0-9a-zA-Z]*»/g, "*");
+  if (/\s/.test(s)) return s;
+  return s.split(/([-_.:])/).map((t) => /^\d{3,}$/.test(t) || /^[0-9a-f]{8,}$/i.test(t) || t.length >= 5 && (t.match(/\d/g)?.length ?? 0) >= 2 && (t.match(/[a-z]/gi)?.length ?? 0) >= 2 ? "*" : t).join("");
+}
+var UNITS = [
+  [/^(?:s|secs?|seconds?)$/i, 1e3],
+  [/^(?:m|mins?|minutes?)$/i, 6e4],
+  [/^(?:h|hrs?|hours?)$/i, 36e5],
+  [/^(?:d|days?)$/i, 864e5],
+  [/^(?:w|wks?|weeks?)$/i, 7 * 864e5],
+  [/^(?:mo|mos|months?)$/i, 30 * 864e5],
+  [/^(?:y|yrs?|years?)$/i, 365 * 864e5]
+];
+var UNIT = "s|secs?|seconds?|m|mins?|minutes?|h|hrs?|hours?|d|days?|w|wks?|weeks?|mo|mos|months?|y|yrs?|years?";
+var AMOUNT = String.raw`\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d+(?:\.\d+)?`;
+var WORDS = "an?|a few|few|several";
+var SPAN = String.raw`(?:(?:${AMOUNT})\s*|(?:${WORDS})\s+)(?:${UNIT})\b\.?`;
+var AGE = new RegExp(String.raw`(?<![\w.,])(?:(?:less than|about|over|almost|nearly)\s+)?${SPAN}(?:(?:\s+and)?[\s,]+${SPAN})*\s+ago\b|\bjust now\b|\bmoments? ago\b|\b(?:seconds|minutes|hours) ago\b`, "gi");
+var AGO = "<ago>";
+function ageOf(phrase) {
+  const p = phrase.toLowerCase();
+  if (/^(?:just now|moments? ago|seconds ago)$/.test(p)) return { lo: 0, hi: 6e4 };
+  if (p === "minutes ago") return { lo: 6e4, hi: 50 * 6e4 };
+  if (p === "hours ago") return { lo: 2 * 36e5, hi: 864e5 };
+  let lo = 0;
+  let hi = 0;
+  for (const m of p.matchAll(new RegExp(String.raw`(?:(${AMOUNT})\s*|(${WORDS})\s+)(${UNIT})\b`, "gi"))) {
+    const unit = UNITS.find(([re]) => re.test(m[3]))?.[1] ?? 6e4;
+    if (m[1]) {
+      const n = Number(m[1].replace(/,/g, ""));
+      lo += n * unit;
+      hi += n * unit;
+    } else if (/^an?$/.test(m[2])) {
+      lo += 0.75 * unit;
+      hi += unit;
+    } else {
+      lo += unit === 1e3 ? 0 : 2 * unit;
+      hi += unit === 1e3 ? 6e4 : 4 * unit;
+    }
+  }
+  return p.startsWith("less than") ? { lo: 0, hi } : { lo, hi };
+}
+function agesIn(line) {
+  const phrases = line.match(AGE);
+  if (!phrases) return null;
+  return { form: line.replace(AGE, AGO), ages: phrases.map(ageOf) };
+}
+var ageless = (line) => line.replace(AGE, AGO);
+var ROLLOVER_MS = 6e4;
+function sameAges(a, b, later) {
+  return a.length === b.length && a.every((x, i) => b[i].hi - x.lo >= later.min - ROLLOVER_MS && b[i].lo - x.hi <= later.max + ROLLOVER_MS);
+}
+function lineWeight(line) {
+  const words = line.split(/\s+/).filter((w) => new RegExp("\\p{L}{2,}", "u").test(w) && !new RegExp("^[\\d.,$\u20AC\xA3]+\\p{L}{0,3}%?$", "u").test(w));
+  return words.length >= 2 ? 2 : words.length === 1 ? 1 : 0;
+}
 
 // src/compare.ts
 var REDACTED = "[redacted]";
-var GROUPINGS = ["names", "roles", "kinds"];
+var GROUPINGS = ["names", "roles", "kinds", "optional"];
 var blankDigits = (s) => s.replace(/\d+/g, "N");
 var GENERIC = /* @__PURE__ */ new Set(["div", "span", "b", "i", "u", "s", "small", "bdi", "bdo", "samp", "data"]);
 function targetName(t) {
-  return blankDigits((t ?? "").replace(/\s*\(\d+\)/g, "")).trim();
+  return blankDigits(ageless(t ?? "").replace(/\s*\(\d+\)/g, "")).trim();
 }
 function targetRole(t) {
   const role = (t ?? "").split(/[\s"]/)[0] ?? "";
@@ -467,12 +542,31 @@ function sameValue(a, b) {
   if (a === void 0 || b === void 0) return false;
   return fits(a, b) || fits(b, a);
 }
-var ONE_VALUE = String.raw`(?:"(?:[^"\\]|\\.)*"|[^,\s{}\[\]]+|\[redacted\])`;
+function valueEnds(s, at) {
+  if (s[at] === '"') {
+    for (let i = at + 1; i < s.length; i++) {
+      if (s[i] === "\\") i++;
+      else if (s[i] === '"') return [i + 1];
+    }
+    return [];
+  }
+  const ends = s.startsWith(REDACTED, at) ? [at + REDACTED.length] : [];
+  for (let i = at; i < s.length && !/[,\s{}[\]]/.test(s[i]); i++) ends.push(i + 1);
+  return ends;
+}
 function fits(pattern, s) {
   if (pattern === REDACTED) return true;
   if (!pattern.includes(REDACTED)) return false;
-  const re = new RegExp(`^${pattern.split(REDACTED).map((p) => p.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join(ONE_VALUE)}$`);
-  return re.test(s);
+  const [first, ...pieces] = pattern.split(REDACTED);
+  if (!s.startsWith(first)) return false;
+  let at = /* @__PURE__ */ new Set([first.length]);
+  for (const piece of pieces) {
+    const next = /* @__PURE__ */ new Set();
+    for (const p of at) for (const e of valueEnds(s, p)) if (s.startsWith(piece, e)) next.add(e + piece.length);
+    if (!next.size) return false;
+    at = next;
+  }
+  return at.has(s.length);
 }
 function sameValues(a, b) {
   if (a.length !== b.length) return false;
@@ -496,6 +590,11 @@ function stateValue(state, name) {
   const list = Object.entries(state).filter(([k]) => re.test(k)).map(([, v]) => v);
   return list.length === 0 ? void 0 : list.length === 1 ? list[0] : `[${list.sort().join(" | ")}]`;
 }
+function fieldValue(fields, name, except = []) {
+  if (fields?.[name] !== void 0) return fields[name];
+  const list = Object.entries(fields ?? {}).filter(([k]) => fieldShape(k) === name && !except.includes(k)).map(([, v]) => v);
+  return list.length === 0 ? void 0 : list.length === 1 ? list[0] : `[${list.sort().join(" | ")}]`;
+}
 function settledAfterActs(r) {
   if (!r.snapshot) return false;
   let last = -Infinity;
@@ -506,9 +605,29 @@ function endedDifferently(d) {
   return d.fields.length > 0 || d.textOnlyBaseline.length > 0 || d.textOnlyRun.length > 0 || d.errors.length > 0;
 }
 var SAFE = /^(GET|HEAD|OPTIONS)\s/;
-var shownField = (f) => f.where === "field" || f.where === "requests" && !SAFE.test(f.name);
+var POST = /^POST\s/;
+var onOneSide = (f) => f.baseline === "(absent)" || f.run === "(absent)";
+var shownField = (f) => f.where === "field" || f.where === "requests" && !SAFE.test(f.name) && (!POST.test(f.name) || onOneSide(f) || !!f.evidence);
 function visibleDiff(d) {
   return d.fields.some(shownField) || d.textOnlyBaseline.length > 0 || d.textOnlyRun.length > 0 || d.errors.length > 0;
+}
+function bestLine(d) {
+  return Math.max(-1, ...[...d.textOnlyBaseline, ...d.textOnlyRun].map(lineWeight));
+}
+function strongestFirst(diffs) {
+  const score = (d) => bestLine(d) === 2 ? 5 : d.errors.length ? 4 : d.fields.some((f) => f.where === "field") ? 3 : bestLine(d) === 1 ? 2 : d.fields.some(shownField) ? 1 : 0;
+  return diffs.map((d, i) => ({ d, i, s: score(d) })).sort((x, y) => y.s - x.s || x.i - y.i).map((x) => x.d);
+}
+function nameDifference(d) {
+  const line = (weight) => {
+    const inRun = d.textOnlyRun.find((l) => lineWeight(l) === weight);
+    if (inRun !== void 0) return `it shows ${q(inRun, 80)}, which the baseline does not`;
+    const inBase = d.textOnlyBaseline.find((l) => lineWeight(l) === weight);
+    return inBase !== void 0 ? `it does not show ${q(inBase, 80)}, which the baseline does` : null;
+  };
+  const field = d.fields.find((f) => f.where === "field");
+  const write = d.fields.find(shownField);
+  return line(2) ?? (d.errors.length ? `an error only there: ${q(d.errors[0], 100)}` : null) ?? (field ? `form field ${q(field.name, 60)} is ${q(field.run, 60)}, ${q(field.baseline, 60)} in the baseline` : null) ?? line(1) ?? (write ? `requests sent to ${q(write.name, 80)}: ${q(write.run, 20)}, ${q(write.baseline, 20)} in the baseline` : null) ?? line(0) ?? "what it sent or showed differs";
 }
 function multiset(lines) {
   const m = /* @__PURE__ */ new Map();
@@ -520,7 +639,95 @@ function onlyIn(a, b) {
   for (const [l, n] of a) for (let i = b.get(l) ?? 0; i < n; i++) out.push(l);
   return out;
 }
-var lineShape = (l) => l.replace(/[\w.:/-]*\d[\w.:/-]*/g, "N");
+function elapsed(x, y) {
+  return { min: y.started - (x.started + (x.snapshot?.t ?? 0)), max: y.started + (y.snapshot?.t ?? 0) - x.started };
+}
+var DIGIT_TOKEN = /[\w.:/-]*\d(?:[\w.:/-]|,(?=\d{3}(?!\d)))*/g;
+var lineShape = (l) => l.replace(DIGIT_TOKEN, "N");
+var tokensOf = (l) => l.match(DIGIT_TOKEN) ?? [];
+var tokenShape = (t) => t.replace(/\d[\d,]*/g, "N");
+var kindOf = (l) => l.replace(DIGIT_TOKEN, tokenShape);
+var NUMBER = /^\d[\d,]*(?:\.\d+)?$/;
+var numberOf = (t) => Number(t.replace(/,/g, ""));
+function slotsOf(a, b) {
+  return a.map((t, i) => t !== b[i] ? { shape: tokenShape(t) === tokenShape(b[i]) ? tokenShape(t) : "" } : NUMBER.test(t) ? { near: numberOf(t), was: t } : { exact: t });
+}
+var nearBy = (n, t) => NUMBER.test(t) && Math.abs(numberOf(t) - n) <= Math.max(2, Math.abs(n) * 0.1);
+var fitsSlots = (slots, tokens) => slots.every((s, i) => "exact" in s ? s.exact === tokens[i] : "near" in s ? nearBy(s.near, tokens[i]) : !s.shape || tokenShape(tokens[i]) === s.shape);
+function slotsText(line, slots) {
+  let i = 0;
+  return line.replace(DIGIT_TOKEN, (t) => {
+    const s = slots[i++];
+    return !s ? t : "exact" in s ? s.exact : "near" in s ? s.was : s.shape || "*";
+  });
+}
+function lineDiff(a, b, later) {
+  const onlyA = onlyIn(a, b);
+  const onlyB = onlyIn(b, a);
+  if (!onlyA.length || !onlyB.length) return { onlyA, onlyB };
+  const aged = (list) => {
+    const m = /* @__PURE__ */ new Map();
+    list.forEach((l, i) => {
+      const x = agesIn(l);
+      if (x) m.set(x.form, [...m.get(x.form) ?? [], { i, ages: x.ages }]);
+    });
+    for (const v of m.values()) v.sort((p, q2) => p.ages[0].lo - q2.ages[0].lo);
+    return m;
+  };
+  const inB = aged(onlyB);
+  const dropA = /* @__PURE__ */ new Set();
+  const dropB = /* @__PURE__ */ new Set();
+  for (const [form, xs] of aged(onlyA)) {
+    const ys = inB.get(form) ?? [];
+    let i = 0;
+    let j = 0;
+    while (i < xs.length && j < ys.length) {
+      if (sameAges(xs[i].ages, ys[j].ages, later)) {
+        dropA.add(xs[i++].i);
+        dropB.add(ys[j++].i);
+      } else if (xs[i].ages[0].lo + later.min < ys[j].ages[0].lo) i++;
+      else j++;
+    }
+  }
+  return { onlyA: onlyA.filter((_, i) => !dropA.has(i)), onlyB: onlyB.filter((_, i) => !dropB.has(i)) };
+}
+var isNoiseLine = (n, l) => {
+  if (n.exact.has(l)) return true;
+  if (n.stable.has(l)) return false;
+  const tokens = tokensOf(l);
+  return !!n.slots.get(lineShape(l))?.some((s) => fitsSlots(s, tokens));
+};
+function lineNoise(base, texts) {
+  const n = { exact: /* @__PURE__ */ new Set(), slots: /* @__PURE__ */ new Map(), labels: /* @__PURE__ */ new Set(), stable: /* @__PURE__ */ new Set(), swapped: [], apart: [] };
+  const b0 = texts[0];
+  for (const l of b0.keys()) if (texts.every((b) => b.has(l))) n.stable.add(l);
+  for (let k = 1; k < texts.length; k++) {
+    const { onlyA: fromFirst, onlyB } = lineDiff(b0, texts[k], elapsed(base[0], base[k]));
+    const unpaired = new Set(fromFirst.keys());
+    const left = [];
+    for (const y of onlyB) {
+      const i = [...unpaired].find((k2) => kindOf(fromFirst[k2]) === kindOf(y)) ?? [...unpaired].find((k2) => lineShape(fromFirst[k2]) === lineShape(y));
+      if (i === void 0) {
+        left.push(y);
+        continue;
+      }
+      unpaired.delete(i);
+      const x = fromFirst[i];
+      const shape2 = lineShape(x);
+      const list = n.slots.get(shape2) ?? [];
+      const slots = slotsOf(tokensOf(x), tokensOf(y));
+      list.push(slots);
+      n.slots.set(shape2, list);
+      n.labels.add(slotsText(x, slots));
+      if (!drifted(x, y)) n.apart.push([x, y]);
+    }
+    const rest = [...unpaired].map((k2) => fromFirst[k2]);
+    for (const l of [...rest, ...left]) n.exact.add(l);
+    if (rest.length === left.length) rest.forEach((x, i) => n.swapped.push([x, left[i]]));
+  }
+  return n;
+}
+var byWeight = (lines) => lines.map((l, i) => ({ l, i, w: lineWeight(l) })).sort((a, b) => b.w - a.w || a.i - b.i).map((x) => x.l);
 function noisyParents(a, b) {
   const kids = (paths) => {
     const m = /* @__PURE__ */ new Map();
@@ -554,7 +761,7 @@ function underNoisy(path, noisy) {
   }
   return null;
 }
-function keyed(s, noisy) {
+function keyed(s, noisy, leftOut, generated) {
   const m = /* @__PURE__ */ new Map();
   if (!s) return m;
   for (const [k, v] of Object.entries(s.state)) {
@@ -564,9 +771,28 @@ function keyed(s, noisy) {
     if (list) list.push(v);
     else m.set(name, [v]);
   }
-  for (const [k, v] of Object.entries(s.fields ?? {})) m.set(`field ${k}`, [v]);
-  for (const [k, v] of Object.entries(s.requests)) m.set(`requests ${k}`, [String(v)]);
+  for (const [k, v] of Object.entries(s.fields ?? {})) {
+    const shape2 = fieldShape(k);
+    const name = `field ${generated?.shapes.has(shape2) && !generated.kept.has(k) ? shape2 : k}`;
+    const list = m.get(name);
+    if (list) list.push(v);
+    else m.set(name, [v]);
+  }
+  for (const [k, v] of Object.entries(s.requests)) if (!leftOut?.has(k)) m.set(`requests ${k}`, [String(v)]);
   return m;
+}
+function generatedNames(base) {
+  const shapes = /* @__PURE__ */ new Set();
+  const names = base.map((b) => Object.keys(b.snapshot?.fields ?? {}));
+  for (const here of names)
+    for (const there of names) {
+      if (here === there) continue;
+      const other = new Set(there);
+      const theirs = new Set(there.filter((k) => !here.includes(k)).map(fieldShape));
+      for (const k of here) if (!other.has(k) && fieldShape(k) !== k && theirs.has(fieldShape(k))) shapes.add(fieldShape(k));
+    }
+  const kept = new Set((names[0] ?? []).filter((k) => names.every((n) => n.includes(k))));
+  return { shapes, kept };
 }
 var shown = (v) => !v ? "(absent)" : v.length === 1 ? v[0] : `[${[...v].sort().join(" | ")}]`;
 function witnessesOf(run) {
@@ -575,36 +801,233 @@ function witnessesOf(run) {
 function groupAt(runs, level) {
   const groups = /* @__PURE__ */ new Map();
   for (const r of runs) {
-    const k = `${r.page.route}
+    const k = `${routeShape(r.page.route)}
 ${scenarioOf(r, level)}`;
     const g = groups.get(k) ?? [];
     g.push(r);
     groups.set(k, g);
   }
-  return groups;
+  return level === "optional" ? mergeOptional(groups) : groups;
 }
-var isBaseline = (r) => r.schedule?.order === "fifo";
-function comparable(groups) {
+var OPTIONAL_ACTIONS = 2;
+function withOptional(a, b) {
+  if (!a.length || b.length <= a.length || b.length - a.length > OPTIONAL_ACTIONS) return false;
+  let i = 0;
+  for (const x of b) if (x === a[i]) i++;
+  return i === a.length;
+}
+function mergeOptional(groups) {
+  const entries = [...groups.entries()].map(([k, runs]) => ({ k, route: k.slice(0, k.indexOf("\n")), acts: scenarioOf(runs[0], "kinds").split("\n").filter(Boolean), runs }));
+  const out = /* @__PURE__ */ new Map();
+  for (const e of [...entries].sort((x, y) => y.acts.length - x.acts.length)) {
+    const into = [...out.keys()].find((k) => {
+      const t = entries.find((o) => o.k === k);
+      return t.route === e.route && withOptional(e.acts, t.acts);
+    });
+    if (into) out.get(into).push(...e.runs);
+    else out.set(e.k, [...e.runs]);
+  }
+  return out;
+}
+var isFifo = (r) => r.schedule?.order === "fifo";
+var isSlow = (r) => (r.schedule?.delay?.maxMs ?? 0) > 0;
+function baselinesOf(g, session) {
+  const fifo = g.filter(isFifo);
+  if (!session.some((r) => isFifo(r) && isSlow(r))) return { base: fifo, plain: null };
+  return { base: fifo.filter(isSlow), plain: fifo.find((r) => !isSlow(r)) ?? null };
+}
+function comparable(groups, session) {
   let n = 0;
-  for (const g of groups.values()) if (g.filter(isBaseline).length >= 2) n += g.filter((r) => !isBaseline(r)).length;
+  for (const g of groups.values()) {
+    const { base, plain } = baselinesOf(g, session);
+    if (base.length >= 2) n += 2 * g.filter((r) => !isFifo(r)).length + (plain ? 1 : 0);
+  }
   return n;
 }
 function groupRuns(runs) {
   const settled = runs.filter(settledAfterActs);
   const levels = GROUPINGS.map((level) => ({ level, groups: groupAt(settled, level) }));
-  const best = Math.max(...levels.map((l) => comparable(l.groups)));
-  const pick = levels.find((l) => comparable(l.groups) === best) ?? levels[0];
+  const best = Math.max(...levels.map((l) => comparable(l.groups, settled)));
+  const pick = levels.find((l) => comparable(l.groups, settled) === best) ?? levels[0];
   return { grouping: pick.level, groups: pick.groups };
+}
+var inFlightTwice = (x, sig) => x.witnesses.some((w) => w.kind === "identical-in-flight" && (w.subject === sig || sigOf(w.by) === sig));
+var sentDirectly = (x, sig) => x.steps.filter((s) => s.k === "send" && sigOf(s.key) === sig && s.act !== void 0 && s.via === void 0).length;
+function writeEvidence(sig, ref, r) {
+  if (inFlightTwice(r, sig) !== inFlightTwice(ref, sig)) return "two identical requests in flight";
+  const [mine, theirs] = [sentDirectly(r, sig), sentDirectly(ref, sig)];
+  if (mine !== theirs) return `a user action sent it directly ${mine} time(s), ${theirs} in the baseline`;
+  return void 0;
+}
+var hostOf = (sig) => /^[A-Z]+ ([^/\s]+)(?:\/|$)/.exec(sig)?.[1] ?? null;
+var siteOf = (host) => host.split(".").slice(-2).join(".");
+var LOCAL = /^(?:localhost|\[::1\]|0\.0\.0\.0|127\.\d+\.\d+\.\d+|10\.\d+\.\d+\.\d+|192\.168\.\d+\.\d+|172\.(?:1[6-9]|2\d|3[01])\.\d+\.\d+|host\.docker\.internal|[^.]+|.*\.(?:local|localhost|internal))$/;
+function thirdPartyOf(g) {
+  const out = /* @__PURE__ */ new Set();
+  const kept = /* @__PURE__ */ new Set();
+  for (const r of g) {
+    let pageHost = "";
+    try {
+      pageHost = new URL(r.page.url).hostname;
+    } catch {
+      continue;
+    }
+    const foreign = (sig) => {
+      const h = hostOf(sig)?.replace(/:\d+$/, "");
+      return !!h && !LOCAL.test(h) && siteOf(h) !== siteOf(pageHost);
+    };
+    for (const sig of Object.keys(r.snapshot?.requests ?? {})) if (foreign(sig) && SAFE.test(sig)) out.add(sig);
+    for (const s of r.steps) {
+      if (s.k !== "send") continue;
+      const sig = sigOf(s.key);
+      if (foreign(sig) && s.act !== void 0) kept.add(sig);
+      if (!foreign(sig) && s.via && hostOf(s.via)) kept.add(s.via);
+    }
+  }
+  for (const sig of kept) out.delete(sig);
+  return out;
+}
+var linesOf = (lines) => multiset(lines ?? []);
+function standsIn(list, line, later) {
+  if (list.includes(line)) return true;
+  const x = agesIn(line);
+  return !!x && list.some((l) => {
+    const y = agesIn(l);
+    return !!y && y.form === x.form && sameAges(y.ages, x.ages, later);
+  });
+}
+var BARE_COUNT = /^\d[\d.,]*[kKmMbB]?\+?$/;
+function fromOtherSite(ref, r, leftOut, fields, onlyRef, onlyRun) {
+  const lines = [...onlyRef, ...onlyRun];
+  if (!lines.length || !lines.every((l) => BARE_COUNT.test(l))) return false;
+  const writers = (x, path) => new Set(x.steps.flatMap((s) => s.k === "write" && s.by && s.paths.includes(path) ? [s.by] : []));
+  const alone = fields.filter((f) => {
+    if (f.where !== "state" || r.witnesses.some((w) => w.kind === "overwrote-newer" && w.subject === f.name)) return false;
+    const by = [...writers(r, f.name), ...writers(ref, f.name)];
+    if (!by.length || new Set(by).size !== 1) return false;
+    const sig = sigOf(by[0]);
+    return leftOut.has(sig) && [ref, r].every((x) => (x.snapshot?.requests[sig] ?? 0) <= 1);
+  });
+  const digits = (l) => l.replace(/[^\d]/g, "");
+  const stands = (l, value) => alone.some((f) => value(f).replace(/[^\d]/g, "").startsWith(digits(l)));
+  return onlyRef.every((l) => stands(l, (f) => f.baseline)) && onlyRun.every((l) => stands(l, (f) => f.run));
+}
+function diffRun(ref, r, c) {
+  const rk = keyed(r.snapshot, c.noisy, c.leftOut, c.generated);
+  const runCut = (r.snapshot?.stateLeft ?? 0) > 0;
+  const fields = [];
+  for (const name of /* @__PURE__ */ new Set([...ref.keys.keys(), ...rk.keys()])) {
+    if (c.noiseName.has(name)) continue;
+    const a = ref.keys.get(name);
+    const v = rk.get(name);
+    if (a && v && sameValues(a, v)) continue;
+    const sp = name.indexOf(" ");
+    const where = name.slice(0, sp) === "state" ? "state" : name.slice(0, sp) === "field" ? "field" : "requests";
+    if (where === "state" && (!a && c.cut || !v && runCut)) continue;
+    const told = c.delay?.fields.get(name);
+    if (told !== void 0 && (told === null && !v || told && v && sameValues(told, v))) continue;
+    const f = { where, name: name.slice(sp + 1), baseline: shown(a), run: shown(v) };
+    if (where === "requests" && POST.test(f.name)) {
+      const evidence = onOneSide(f) ? f.run === "(absent)" ? "the baseline sends it and this run never does" : "only this run sends it" : writeEvidence(f.name, ref.run, r);
+      if (evidence) f.evidence = evidence;
+    }
+    if (where === "field" && c.generated.shapes.has(f.name)) {
+      const except = [...c.generated.kept].filter((k) => fieldShape(k) === f.name);
+      if (except.length) f.except = except;
+    }
+    fields.push(f);
+  }
+  const rank = (f) => f.where === "field" ? 0 : shownField(f) ? 1 : 2;
+  fields.sort((x, y) => rank(x) - rank(y));
+  const rt = linesOf(r.snapshot?.text);
+  const liveR = new Set(r.snapshot?.live ?? []);
+  const { onlyA, onlyB: came } = lineDiff(ref.text, rt, elapsed(ref.run, r));
+  const onlyB = onlyA.filter((l) => !isNoiseLine(c.lines, l) && !c.delay?.gone.includes(l));
+  const onlyR = came.filter((l) => !isNoiseLine(c.lines, l) && !(c.delay && standsIn(c.delay.come, l, elapsed(c.delay.plain, r))));
+  const announced = [...onlyB.filter((l) => ref.live.has(l)), ...onlyR.filter((l) => liveR.has(l))];
+  const textOnlyBaseline = byWeight(onlyB.filter((l) => !ref.live.has(l)));
+  const textOnlyRun = byWeight(onlyR.filter((l) => !liveR.has(l)));
+  const errors = [...new Set(r.errors.map((e) => e.message))].filter((m) => !c.errors.has(m));
+  const witnesses = [...new Set(witnessesOf(r))].filter((w) => !c.witnesses.has(w));
+  if (!(fields.length || textOnlyBaseline.length || textOnlyRun.length || announced.length || errors.length || witnesses.length)) return null;
+  const parts = { fields, textOnlyBaseline, textOnlyRun, errors };
+  let tier = visibleDiff(parts) ? "visible" : fields.length || announced.length ? "internal" : "transient";
+  const otherSite = tier === "visible" && c.leftOut.size > 0 && !errors.length && !fields.some(shownField) && fromOtherSite(ref.run, r, c.leftOut, fields, textOnlyBaseline, textOnlyRun);
+  if (otherSite) tier = "internal";
+  const textCounts = {};
+  for (const l of [...textOnlyBaseline.slice(0, 15), ...textOnlyRun.slice(0, 15)]) textCounts[l] = { baseline: ref.text.get(l) ?? 0, run: rt.get(l) ?? 0 };
+  return { run: r.id, label: r.assignment?.label ?? r.schedule?.label ?? r.id, tier, fields: fields.slice(0, 30), textOnlyBaseline: textOnlyBaseline.slice(0, 15), textOnlyRun: textOnlyRun.slice(0, 15), ...Object.keys(textCounts).length ? { textCounts } : {}, ...announced.length ? { announced: announced.slice(0, 10) } : {}, errors: errors.slice(0, 10), witnesses: witnesses.slice(0, 10), forced: r.forced, ...otherSite ? { otherSite } : {} };
+}
+function drifted(x, y) {
+  if (kindOf(x) !== kindOf(y)) return false;
+  const [a, b] = [tokensOf(x), tokensOf(y)];
+  return a.every((t, i) => t === b[i] || NUMBER.test(t) && nearBy(numberOf(t), b[i]));
+}
+var countOnly = (f) => f.where === "requests" && !SAFE.test(f.name) && !onOneSide(f);
+function delayOf(plain, base, rest, c) {
+  const noPlain = { ...c, errors: new Set(plain.run.errors.map((e) => e.message)), witnesses: new Set(witnessesOf(plain.run)) };
+  const each = base.map((b) => diffRun(plain, b, noPlain));
+  const common = (of, key = (x) => String(x)) => each.every((d) => !!d) ? of(each[0]).filter((x) => each.every((d) => of(d).some((y) => key(y) === key(x)))) : [];
+  const thirds = c.lines.swapped.filter(([x, y]) => !plain.text.has(x) && !plain.text.has(y)).length;
+  let textOnlyBaseline = common((d) => d.textOnlyBaseline);
+  if (textOnlyBaseline.length <= thirds) textOnlyBaseline = [];
+  let textOnlyRun = common((d) => d.textOnlyRun);
+  const drift = [];
+  for (const x of textOnlyRun) {
+    const y = textOnlyBaseline.find((l) => drifted(x, l));
+    if (y === void 0) continue;
+    drift.push([x, y]);
+    textOnlyBaseline = textOnlyBaseline.filter((l) => l !== y);
+  }
+  textOnlyRun = textOnlyRun.filter((x) => !drift.some(([d]) => d === x));
+  const errors = common((d) => d.errors);
+  const fields = common((d) => d.fields, (f) => `${f.where} ${f.name} ${f.baseline} ${f.run}`);
+  const more = (f) => inFlightTwice(base[0], f.name) || sentDirectly(base[0], f.name) > sentDirectly(plain.run, f.name);
+  const says = fields.filter((f) => f.where === "field" && f.run !== "(absent)" || f.where === "requests" && !SAFE.test(f.name) && (!countOnly(f) || more(f)));
+  const reached = textOnlyRun.length > 0 || errors.length > 0 || says.length > 0;
+  const first = each[0];
+  const otherSite = each.every((d) => d?.otherSite);
+  const writes = /* @__PURE__ */ new Map();
+  const said = new Set(says.map((f) => f.name));
+  for (const d of each) for (const f of d?.fields ?? []) if (countOnly(f) && !said.has(f.name)) writes.set(f.name, f);
+  const plainHas = (l) => plain.text.has(l);
+  const skip = new Set(c.lines.swapped.filter(([x, y]) => !plainHas(x) && !plainHas(y)).flat());
+  const atRuns = (text) => rest.filter((r) => linesOf(r.snapshot?.text).has(text)).length;
+  const apart = c.lines.apart.filter(([x, y]) => plainHas(x) !== plainHas(y)).map(([x, y]) => plainHas(x) ? y : x);
+  const lines = byWeight([...[...c.lines.exact].filter((l) => !skip.has(l) && /[\p{L}\d]/u.test(l)), ...apart]).slice(0, 6).map((text) => ({ text, only: plainHas(text) ? "plain" : "slow", runs: atRuns(text) }));
+  if (!reached) for (const text of byWeight(textOnlyBaseline).slice(0, 4)) lines.push({ text, only: "plain-alone", runs: atRuns(text) });
+  const errs = [...new Set(base.flatMap((b) => b.errors.map((e) => e.message)))].filter((m) => !errors.includes(m) && !noPlain.errors.has(m));
+  const fieldLook = [];
+  for (const name of c.noiseName) {
+    if (!name.startsWith("field ") && !(name.startsWith("requests ") && !SAFE.test(name.slice(9)))) continue;
+    const p = plain.keys.get(name);
+    const vals = base.map((b) => keyed(b.snapshot, c.noisy, c.leftOut, c.generated).get(name));
+    const off = vals.find((v) => !(v && p && sameValues(v, p)));
+    if (off && vals.some((v) => v && p && sameValues(v, p) || !v && !p)) fieldLook.push({ where: name.startsWith("field ") ? "field" : "requests", name: name.slice(name.indexOf(" ") + 1), baseline: shown(p), run: shown(off) });
+  }
+  const look = lines.length || drift.length || errs.length || fieldLook.length || writes.size ? { lines, drift: drift.slice(0, 4), errors: errs.slice(0, 3), fields: fieldLook.slice(0, 4), writes: [...writes.values()].slice(0, 4) } : void 0;
+  if (!reached || !first || otherSite) return look ? { look } : {};
+  const sides = rest.some((r) => {
+    const t = linesOf(r.snapshot?.text);
+    const k = keyed(r.snapshot, c.noisy, c.leftOut, c.generated);
+    return textOnlyRun.some((l) => !t.has(l)) || textOnlyBaseline.some((l) => t.has(l)) || errors.some((m) => !r.errors.some((e) => e.message === m)) || says.some((f) => {
+      const [p, v] = [plain.keys.get(`${f.where} ${f.name}`), k.get(`${f.where} ${f.name}`)];
+      return !p && !v || !!p && !!v && sameValues(p, v);
+    });
+  });
+  const delay = { ...first, tier: "visible", textOnlyBaseline, textOnlyRun, errors, fields: [...says, ...first.fields.filter((f) => !says.includes(f) && !writes.has(f.name))], witnesses: [], of: base.length, differing: base.length, ...sides ? {} : { oneLoad: true } };
+  return { delay, ...look ? { look } : {}, told: { plain: plain.run, gone: textOnlyRun, come: textOnlyBaseline, fields: new Map(says.map((f) => [`${f.where} ${f.name}`, plain.keys.get(`${f.where} ${f.name}`) ?? null])) } };
 }
 function compareRuns(runs) {
   const { grouping, groups } = groupRuns(runs);
+  const session = runs.filter(settledAfterActs);
   const out = [];
   for (const g of groups.values()) {
     const route = g[0].page.route;
-    const base = g.filter(isBaseline);
-    const rest = g.filter((r) => !isBaseline(r));
+    const { base, plain } = baselinesOf(g, session);
+    const rest = g.filter((r) => !isFifo(r));
     const scenario = scenarioOf(base[0] ?? g[0]);
-    const rep = { route, scenario, scenarioKey: scenarioOf(base[0] ?? g[0], grouping), grouping, baselines: base.map((r) => r.id), runs: g.length, compared: base.length >= 2 ? rest.length : 0, noise: [], diffs: [], missingBaseline: base.length === 0, insufficientBaselines: base.length === 1, unfiltered: [] };
+    const rep = { route, scenario, scenarioKey: scenarioOf(base[0] ?? g[0], grouping), grouping, baselines: base.map((r) => r.id), runs: g.length, compared: base.length >= 2 ? rest.length : 0, noise: [], diffs: [], missingBaseline: base.length === 0, insufficientBaselines: base.length === 1, unfiltered: [], ...plain ? { plainBaseline: plain.id } : {} };
     const cut = g.filter((r) => (r.snapshot?.stateLeft ?? 0) > 0);
     if (cut.length) rep.truncated = { runs: cut.length, left: Math.max(...cut.map((r) => r.snapshot.stateLeft)), total: Math.max(...cut.map((r) => r.snapshot.stateTotal ?? 0)) };
     if (!base.length) {
@@ -612,63 +1035,40 @@ function compareRuns(runs) {
       continue;
     }
     const b0 = base[0];
+    const leftOut = thirdPartyOf(g);
+    if (leftOut.size) rep.thirdParty = [...leftOut].slice(0, 10);
     const noisy = /* @__PURE__ */ new Set();
     for (const b of base.slice(1)) for (const p of noisyParents(Object.keys(b0.snapshot?.state ?? {}), Object.keys(b.snapshot?.state ?? {}))) noisy.add(p);
-    const bk = keyed(b0.snapshot, noisy);
-    const bt = multiset(b0.snapshot?.text ?? []);
+    const generated = generatedNames(base);
+    const texts = base.map((b) => linesOf(b.snapshot?.text));
+    const lines = lineNoise(base, texts);
+    const bk = keyed(b0.snapshot, noisy, leftOut, generated);
     const noise = new Set([...noisy].map((p) => `state ${p}.* (record ids)`));
     const noiseName = /* @__PURE__ */ new Set();
-    const noiseShape = /* @__PURE__ */ new Set();
     for (const b of base.slice(1)) {
-      const o = keyed(b.snapshot, noisy);
+      const o = keyed(b.snapshot, noisy, leftOut, generated);
       for (const [name, v] of bk) {
         const w = o.get(name);
         if (!w || !sameValues(v, w)) noiseName.add(name);
       }
       for (const name of o.keys()) if (!bk.has(name)) noiseName.add(name);
-      const ot = multiset(b.snapshot?.text ?? []);
-      for (const l of [...onlyIn(bt, ot), ...onlyIn(ot, bt)]) noiseShape.add(lineShape(l));
     }
     for (const n of noiseName) noise.add(n);
-    for (const s of noiseShape) noise.add(`text ${JSON.stringify(s)}`);
+    for (const l of byWeight([...lines.exact])) noise.add(`text ${JSON.stringify(l)}`);
+    for (const l of lines.labels) noise.add(`text ${JSON.stringify(l)}`);
     rep.noise = [...noise].slice(0, 40);
-    const isNoiseLine = (l) => noiseShape.has(lineShape(l));
-    const baseErrors = new Set(base.flatMap((b) => b.errors.map((e) => e.message)));
-    const baseWit = new Set(base.flatMap(witnessesOf));
-    const baseCut = (b0.snapshot?.stateLeft ?? 0) > 0;
+    const sideOf = (run, keys, text) => ({ run, keys, text, live: new Set(run.snapshot?.live ?? []) });
+    const ctx = { noisy, leftOut, generated, noiseName, lines, errors: new Set(base.flatMap((b) => b.errors.map((e) => e.message))), witnesses: new Set(base.flatMap(witnessesOf)), cut: (b0.snapshot?.stateLeft ?? 0) > 0 };
+    if (plain && base.length >= 2) {
+      const { delay, look, told } = delayOf(sideOf(plain, keyed(plain.snapshot, noisy, leftOut, generated), linesOf(plain.snapshot?.text)), base, rest, ctx);
+      if (delay) rep.delay = delay;
+      if (look) rep.look = look;
+      if (told) ctx.delay = told;
+    }
+    const reference = sideOf(b0, bk, texts[0]);
     for (const r of rest) {
-      const rk = keyed(r.snapshot, noisy);
-      const runCut = (r.snapshot?.stateLeft ?? 0) > 0;
-      const fields = [];
-      for (const name of /* @__PURE__ */ new Set([...bk.keys(), ...rk.keys()])) {
-        if (noiseName.has(name)) continue;
-        const a = bk.get(name);
-        const c = rk.get(name);
-        if (a && c && sameValues(a, c)) continue;
-        const sp = name.indexOf(" ");
-        const where = name.slice(0, sp) === "state" ? "state" : name.slice(0, sp) === "field" ? "field" : "requests";
-        if (where === "state" && (!a && baseCut || !c && runCut)) continue;
-        fields.push({ where, name: name.slice(sp + 1), baseline: shown(a), run: shown(c) });
-      }
-      fields.sort((x, y) => Number(!shownField(x)) - Number(!shownField(y)));
-      const rt = multiset(r.snapshot?.text ?? []);
-      const liveB = new Set(b0.snapshot?.live ?? []);
-      const liveR = new Set(r.snapshot?.live ?? []);
-      const onlyB = onlyIn(bt, rt).filter((l) => !isNoiseLine(l));
-      const onlyR = onlyIn(rt, bt).filter((l) => !isNoiseLine(l));
-      const announced = [...onlyB.filter((l) => liveB.has(l)), ...onlyR.filter((l) => liveR.has(l))];
-      const textOnlyBaseline = onlyB.filter((l) => !liveB.has(l));
-      const textOnlyRun = onlyR.filter((l) => !liveR.has(l));
-      const errors = [...new Set(r.errors.map((e) => e.message))].filter((m) => !baseErrors.has(m));
-      const witnesses = [...new Set(witnessesOf(r))].filter((w) => !baseWit.has(w));
-      if (fields.length || textOnlyBaseline.length || textOnlyRun.length || announced.length || errors.length || witnesses.length) {
-        const parts = { fields, textOnlyBaseline, textOnlyRun, errors };
-        const tier = visibleDiff(parts) ? "visible" : fields.length || announced.length ? "internal" : "transient";
-        const textCounts = {};
-        for (const l of [...textOnlyBaseline.slice(0, 15), ...textOnlyRun.slice(0, 15)]) textCounts[l] = { baseline: bt.get(l) ?? 0, run: rt.get(l) ?? 0 };
-        const d = { run: r.id, label: r.assignment?.label ?? r.schedule?.label ?? r.id, tier, fields: fields.slice(0, 30), textOnlyBaseline: textOnlyBaseline.slice(0, 15), textOnlyRun: textOnlyRun.slice(0, 15), ...Object.keys(textCounts).length ? { textCounts } : {}, ...announced.length ? { announced: announced.slice(0, 10) } : {}, errors: errors.slice(0, 10), witnesses: witnesses.slice(0, 10), forced: r.forced };
-        (rep.insufficientBaselines ? rep.unfiltered : rep.diffs).push(d);
-      }
+      const d = diffRun(reference, r, ctx);
+      if (d) (rep.insufficientBaselines ? rep.unfiltered : rep.diffs).push(d);
     }
     out.push(rep);
   }
@@ -829,6 +1229,7 @@ function regressionTest(f, run, spec2) {
     const visible = shown2.length > 0 || onlyBase.length > 0 || onlyRun.length > 0 || errs.length > 0;
     const fields = visible ? shown2 : all;
     const pooledUsed = fields.slice(0, 5).some((d) => d.where === "state" && d.name.split(".").includes("*"));
+    const pooledField = fields.slice(0, 5).some((d) => d.where === "field" && d.name.includes("*") && !!d.name.replace(/\*/g, "").trim());
     if (pooledUsed) {
       lines.push(`  const stateValue = (state: Record<string, string>, name: string) => {`);
       lines.push(`    const re = new RegExp("^" + name.split(".").map((s) => (s === "*" ? "[^.]+" : s.replace(/[.*+?^\${}()|[\\]\\\\]/g, "\\\\$&"))).join("\\\\.") + "$");`);
@@ -836,19 +1237,30 @@ function regressionTest(f, run, spec2) {
       lines.push(`    return list.length === 0 ? undefined : list.length === 1 ? list[0] : "[" + list.sort().join(" | ") + "]";`);
       lines.push(`  };`);
     }
+    if (pooledField) {
+      lines.push(`  const fieldValue = (fields: Record<string, string> = {}, name: string, except: string[] = []) => {`);
+      lines.push(`    const re = new RegExp("^" + name.split("*").map((s) => s.replace(/[.*+?^\${}()|[\\]\\\\]/g, "\\\\$&")).join(".*") + "$");`);
+      lines.push(`    const list = Object.entries(fields).filter(([k]) => re.test(k) && !except.includes(k)).map(([, v]) => v);`);
+      lines.push(`    return list.length === 0 ? undefined : list.length === 1 ? list[0] : "[" + list.sort().join(" | ") + "]";`);
+      lines.push(`  };`);
+    }
     for (const d of fields.slice(0, 5)) {
+      if (d.where === "field" && !d.name.replace(/\*/g, "").trim()) {
+        lines.push(`  // the failing run's field ${lit(d.name)} has only a generated name, so no line can find it: assert it by its label or role`);
+        continue;
+      }
       const want = d.baseline === "(absent)" ? ".toBeUndefined()" : `.toBe(${lit(d.baseline)})`;
       const name = lit(d.name);
       if (d.where === "state") lines.push(`  expect(${d.name.split(".").includes("*") ? `stateValue(snap.state, ${name})` : `snap.state[${name}]`}, "as with responses in request order")${want};`);
-      else if (d.where === "field") lines.push(`  expect(snap.fields?.[${name}], "as with responses in request order")${want};`);
+      else if (d.where === "field") lines.push(`  expect(${d.name.includes("*") ? `fieldValue(snap.fields, ${name}${d.except?.length ? `, ${JSON.stringify(d.except.map((k) => clean(k, 200)))}` : ""})` : `snap.fields?.[${name}]`}, "as with responses in request order")${want};`);
       else lines.push(`  expect(snap.requests[${name}] ?? 0, "requests sent, as with responses in request order").toBe(${Number(d.baseline) || 0});`);
       asserts++;
     }
-    for (const l of onlyBase.slice(0, 3)) {
+    for (const l of onlyBase.filter((x) => !agesIn(x)).slice(0, 3)) {
       lines.push(`  expect(snap.text, "the page shows what it shows with responses in request order").toContain(${lit(l)});`);
       asserts++;
     }
-    for (const l of onlyRun.slice(0, 3)) {
+    for (const l of onlyRun.filter((x) => !agesIn(x)).slice(0, 3)) {
       lines.push(`  expect(snap.text, "the page does not show what only the failing order showed").not.toContain(${lit(l)});`);
       asserts++;
     }
@@ -1177,14 +1589,15 @@ var Store = class {
     if (h.ua) run.ua = h.ua;
     if (h.mode || h.model) run.runtime = { ...h.mode ? { mode: h.mode } : {}, ...h.model ? { model: h.model } : {} };
     if (!h.schedule) {
-      const arm = this.replays.find((r) => r.remaining > 0 && now - r.created < ARM_TTL_MS && (!r.route || r.route === h.route));
+      const here = routeShape(h.route);
+      const arm = this.replays.find((r) => r.remaining > 0 && now - r.created < ARM_TTL_MS && (!r.route || routeShape(r.route) === here));
       if (arm) {
         arm.remaining--;
         arm.runs.push(id);
         run.schedule = { ...arm.spec, id: arm.finding, label: `replay of ${arm.finding}` };
         run.assignment = { kind: "replay", ref: arm.finding, index: arm.runs.length - 1, label: `replay of ${arm.finding}` };
       } else {
-        const x = [...this.explores.values()].find((s) => s.state === "armed" && now - s.created < ARM_TTL_MS && (!s.route || s.route === h.route));
+        const x = [...this.explores.values()].find((s) => s.state === "armed" && now - s.created < ARM_TTL_MS && (!s.route || routeShape(s.route) === here));
         if (x) {
           if (!x.route) x.route = h.route;
           const spec2 = x.plan[x.next];
@@ -1455,7 +1868,8 @@ var Store = class {
   }
   /**
    * Arm an explore session: two fifo baselines, then `runs` seeded orders, all with the same extra latency when asked
-   * (so timing alone never separates the baselines from the seeded runs).
+   * (so timing alone never separates the baselines from the seeded runs). With extra latency, a third baseline without it
+   * comes after the two: a bug that needs only a slow response has something to differ from (AGENT.md section 5.1).
    */
   armExplore(o) {
     for (const x2 of this.explores.values()) if (x2.state === "armed") x2.state = "stopped";
@@ -1464,6 +1878,7 @@ var Store = class {
     const seed0 = o.seed ?? 1;
     const slow = (spec2) => o.delay ? { ...spec2, delay: o.delay, maxHoldMs: Math.min(3e4, 1500 + o.delay.maxMs) } : spec2;
     const plan = [slow({ order: "fifo", label: "baseline 1 (responses in request order)" }), slow({ order: "fifo", label: "baseline 2 (responses in request order)" })];
+    if (o.delay) plan.push({ order: "fifo", label: "baseline without added delay" });
     for (let i = 0; i < n; i++) {
       const spec2 = slow({ order: "seeded", seed: seed0 + i, label: `seed ${seed0 + i}` });
       if (o.focus?.length) spec2.focus = o.focus.slice(0, 20);
@@ -1481,9 +1896,10 @@ var Store = class {
   }
   /**
    * Compare an explore session's runs; a group with two baselines and a run whose difference reached the page (its
-   * text, form values, requests or errors) becomes (or refreshes) a race finding. Differences in store values only, and
-   * overwrites a later response repaired, are reported in the groups but make no finding. A run already counted for a
-   * finding is not counted again when the same session is reported twice.
+   * text, form values, writes or errors) becomes (or refreshes) a race finding, and so does a slow baseline that ended
+   * differently from the baseline with no added delay (what a slow response alone does; replays its slow schedule).
+   * Differences in store values only, and overwrites a later response repaired, are reported in the groups but make no
+   * finding. A run already counted for a finding is not counted again when the same session is reported twice.
    */
   reportExplore(id) {
     const x = id ? this.explores.get(id) : this.latestExplore();
@@ -1494,27 +1910,29 @@ var Store = class {
     const counted = new Set(x.counted ?? []);
     for (const g of groups) {
       if (g.insufficientBaselines) continue;
-      const races = g.diffs.filter((y) => y.tier === "visible");
+      const races = strongestFirst(g.diffs.filter((y) => y.tier === "visible"));
+      const finding = (d2, tag, title, extra) => {
+        const run = this.runs.get(d2.run);
+        if (!run) return;
+        const shown2 = d2.fields.filter(shownField);
+        const kindOfDiff = shown2.length ? `fields:${shown2.map((f) => f.name).sort().join(",")}` : d2.errors.length ? `error:${shape(d2.errors[0])}` : "text";
+        const key = `race|${routeShape(g.route)}|${g.scenarioKey.slice(0, 600)}|${tag}${kindOfDiff}`;
+        const replay = run.schedule ? { ...run.schedule } : { order: "given", given: run.order.slice() };
+        delete replay.id;
+        delete replay.label;
+        const evidence = { session: x.id, scenario: g.scenario, baselines: g.baselines, noise: g.noise, ...d2, endedDifferently: endedDifferently(d2), ...extra };
+        const existing = this.byKey.get(key);
+        if (existing && counted.has(`${run.id}|${key}`)) {
+          const f = this.findings.get(existing);
+          if (f) findings.push(f);
+          return;
+        }
+        findings.push(this.upsert(key, "race", g.route, run, { title, evidence, replay, replace: true }));
+        counted.add(`${run.id}|${key}`);
+      };
+      if (g.delay) finding(g.delay, "slow|", delayTitle(g.delay, g.delay.oneLoad), { delayOnly: true, plainBaseline: g.plainBaseline, failingRuns: [{ run: g.delay.run, label: g.delay.label, endedDifferently: true }], of: g.delay.of, differing: g.delay.differing });
       const d = races[0];
-      if (!d) continue;
-      const run = this.runs.get(d.run);
-      if (!run) continue;
-      const shown2 = d.fields.filter(shownField);
-      const kindOfDiff = shown2.length ? `fields:${shown2.map((f2) => f2.name).sort().join(",")}` : d.errors.length ? `error:${shape(d.errors[0])}` : "text";
-      const key = `race|${g.route}|${g.scenarioKey.slice(0, 600)}|${kindOfDiff}`;
-      const replay = run.schedule ? { ...run.schedule } : { order: "given", given: run.order.slice() };
-      delete replay.id;
-      delete replay.label;
-      const evidence = { session: x.id, scenario: g.scenario, baselines: g.baselines, noise: g.noise, ...d, endedDifferently: endedDifferently(d), failingRuns: races.map((y) => ({ run: y.run, label: y.label, endedDifferently: endedDifferently(y) })), of: g.compared };
-      const existing = this.byKey.get(key);
-      if (existing && counted.has(`${run.id}|${key}`)) {
-        const f2 = this.findings.get(existing);
-        if (f2) findings.push(f2);
-        continue;
-      }
-      const f = this.upsert(key, "race", g.route, run, { title: raceTitle(d), evidence, replay, replace: true });
-      counted.add(`${run.id}|${key}`);
-      findings.push(f);
+      if (d) finding(d, "", raceTitle(d), { failingRuns: races.map((y) => ({ run: y.run, label: y.label, endedDifferently: endedDifferently(y) })), of: g.compared });
     }
     x.counted = [...counted].slice(-500);
     if (x.state === "collecting" && x.runs.length >= x.plan.length) x.state = "stopped";
@@ -1575,7 +1993,7 @@ var Store = class {
         reproduced = hit;
         note = hit ? "the same error was thrown again" : "the error did not recur";
       } else if (f.kind === "race") {
-        const v = raceVerdict(ev, r);
+        const v = raceVerdict(ev, r, { min: r.started - orig.started - (orig.snapshot?.t ?? 0), max: r.started + (r.snapshot?.t ?? 0) - orig.started });
         reproduced = scenarioMatches ? v.reproduced : null;
         note = v.note;
       } else note = "replays verify stale-write, duplicate-request, error and race findings";
@@ -1731,20 +2149,20 @@ function loadFinding(v) {
   return out;
 }
 function raceTitle(d) {
-  const shown2 = d.fields.filter(shownField);
-  if (shown2.length) return `The final state depends on response order: ${shown2.slice(0, 2).map((f) => `${f.where === "requests" ? "requests to" : f.where} ${q(f.name, 60)} (${q(f.baseline, 40)} in request order, ${q(f.run, 40)} under ${q(d.label, 30)})`).join("; ")}`;
-  if (d.errors.length) return `An error depends on response order: ${q(d.errors[0], 120)} under ${q(d.label, 30)}, not in request order`;
-  if (d.textOnlyRun.length) return `The page depends on response order: it shows ${q(d.textOnlyRun[0], 80)} under ${q(d.label, 30)}, not in request order`;
-  if (d.textOnlyBaseline.length) return `The page depends on response order: it no longer shows ${q(d.textOnlyBaseline[0], 80)} under ${q(d.label, 30)}`;
+  if (d.fields.some(shownField) || d.errors.length || d.textOnlyRun.length || d.textOnlyBaseline.length) return `The page depends on response order: under ${q(d.label, 30)} ${nameDifference(d)}`;
   if (d.fields.length) return `The final state depends on response order: ${d.fields.slice(0, 2).map((f) => `${f.where} ${q(f.name, 60)} (${q(f.baseline, 40)} in request order, ${q(f.run, 40)} under ${q(d.label, 30)})`).join("; ")}`;
   const w = d.witnesses[0] ?? "";
   if (w.startsWith("identical-in-flight")) return `The same request was sent twice under ${q(d.label, 30)}, not in request order (the final state matched the baseline): ${q(w, 160)}`;
   return `An older response overwrote newer data under ${q(d.label, 30)} (the final state matched the baseline; users would see it flicker): ${q(w, 160)}`;
 }
-function raceVerdict(ev, r) {
+function delayTitle(d, oneLoad) {
+  const said = nameDifference(d).replace(/the baseline/g, "the run with no added delay");
+  return oneLoad ? `With added latency the page ends differently from the one load with no added delay, the only load that differs (it may be the odd one out): ${said}` : `The page depends on a slow response, no reordering needed: with added latency ${said}`;
+}
+function raceVerdict(ev, r, later) {
   const snap = r.snapshot;
   const all = ev.fields ?? [];
-  const val = (d) => (d.where === "state" ? stateValue(snap.state, d.name) : d.where === "field" ? snap.fields?.[d.name] : snap.requests[d.name] !== void 0 ? String(snap.requests[d.name]) : void 0) ?? "(absent)";
+  const val = (d) => (d.where === "state" ? stateValue(snap.state, d.name) : d.where === "field" ? fieldValue(snap.fields, d.name, d.except) : snap.requests[d.name] !== void 0 ? String(snap.requests[d.name]) : void 0) ?? "(absent)";
   const byValues = (fields) => {
     const same = fields.every((d) => sameValue(val(d), d.run));
     const fixed = fields.every((d) => sameValue(val(d), d.baseline));
@@ -1757,9 +2175,16 @@ function raceVerdict(ev, r) {
     const hit = errors.some((m) => r.errors.some((e) => shape(e.message) === shape(m)));
     return { reproduced: hit, note: hit ? "the same error was thrown again" : "the error did not recur" };
   }
-  const shownN = multiset(snap.text ?? []);
+  const lines = snap.text ?? [];
   const counts = ev.textCounts ?? {};
-  const seen = (l) => shownN.get(l) ?? 0;
+  const seen = (l) => {
+    const x = agesIn(l);
+    return lines.filter((o) => {
+      if (o === l) return true;
+      const y = x && agesIn(o);
+      return !!x && !!y && y.form === x.form && sameAges(x.ages, y.ages, later);
+    }).length;
+  };
   const onlyRun = ev.textOnlyRun ?? [];
   const onlyBase = ev.textOnlyBaseline ?? [];
   if (onlyRun.length || onlyBase.length) {
@@ -2188,7 +2613,7 @@ function scanCommand(cwd, url, o) {
   const flags = ["scan", url, "--json", ...o.phone ? ["--phone"] : [], o.hosted ? "--hosted" : "--local"];
   const bin = localScanBin(cwd);
   if (bin) return { cmd: process.execPath, args: [bin, ...flags], via: "the project's @genclass/runtime" };
-  return { cmd: process.platform === "win32" ? "npx.cmd" : "npx", args: ["-y", "@genclass/runtime@beta", ...flags], via: "npx @genclass/runtime@beta" };
+  return { cmd: process.platform === "win32" ? "npx.cmd" : "npx", args: ["-y", pinnedRuntime(), ...flags], via: `npx ${pinnedRuntime()}` };
 }
 var spawnRunner = (cmd, args2, o) => new Promise((resolve2) => {
   let stdout = "";
@@ -2237,7 +2662,7 @@ function scanText(r, via, stderr) {
   if (said.length) out.push(`The CLI said: ${clean(said.join(" "), 600)}`);
   out.push(
     "",
-    n ? "Next: fix in the app's own source (the suggested CSS is a starting point, not a patch to paste blindly), reload, and call genclass_scan again until it reports no problems; do not call the page done while a high-severity problem is listed." : r.ranAt === "local" ? "Next: nothing to fix in what the visual checks measure. hosted: true adds accessibility, speed and security audits (public pages only)." : `Next: nothing to fix. Full report: ${clean(r.fullReport ?? "", 300)}`
+    n ? "Next: if the user only asked what is wrong, report this and ask before changing anything. If they asked for a fix, or this is a change you are making for them, fix it in the app's own source (the suggested CSS is a starting point, not a patch to paste blindly), reload, and call genclass_scan again until it reports no problems; do not call the page done while a high-severity problem is listed." : r.ranAt === "local" ? "Next: nothing to fix in what the visual checks measure. hosted: true adds accessibility, speed and security audits (public pages only; it sends the URL to the genclass.dev page check, so ask the user first)." : `Next: nothing to fix. Full report: ${clean(r.fullReport ?? "", 300)}`
   );
   return out.join("\n");
 }
@@ -2264,7 +2689,7 @@ async function runScan(args2, cwd, run = spawnRunner) {
   }
   if (!report || report.format !== "genclass-scan/1") {
     const why = clean(r.stderr.trim() || r.stdout.trim() || `exit code ${r.code}`, 1200);
-    const next = /playwright install/i.test(r.stderr) && args2.hosted !== true ? " To scan without a local browser, call genclass_scan again with hosted: true (public pages only; the URL is sent to the genclass.dev page check)." : "";
+    const next = /playwright install/i.test(r.stderr) && args2.hosted !== true ? " Ask the user which they want and wait for a yes: run the command above (a browser download on their machine; npm i -D playwright also edits package.json and the lockfile), or call genclass_scan again with hosted: true (public pages only; the URL is sent to the genclass.dev page check)." : "";
     return { text: `GenClass scan of ${q(url, 200)} failed (via ${c.via}): ${why}${next}`, isError: true };
   }
   return { text: scanText(report, c.via, r.stderr), json: report };
@@ -2277,10 +2702,10 @@ var INSTRUCTIONS = `GenClass finds the web-app bugs that depend on timing and la
 What to do first:
 - An intermittent bug report (the words above): genclass_findings, then genclass_explain on the top finding. Nothing recorded: genclass_explore on the page the user named.
 - After you change code that fetches, submits, autosaves, polls, debounces, paginates or listens to a socket: genclass_explore {action:"start"}, run the same scenario once per armed page load (Playwright or a browser tool: load the page, do the steps, then await window.__GENCLASS_AGENT__.whenSettled()), then genclass_explore {action:"report"}. Do not call the change done while the report shows a race.
-- Before fixing a finding, confirm it: genclass_replay {action:"arm"}, do the same steps, genclass_replay {action:"result"}. After the fix, replay again; "not reproduced" is the evidence. Add the regression test from genclass_explain to the repo.
+- Before fixing a finding, confirm it: genclass_replay {action:"arm"}, do the same steps, genclass_replay {action:"result"}. If the user only asked what broke, report the cause and wait for a yes before you write a fix or a test. After a fix, replay again; "not reproduced" is the evidence. Offer the regression test from genclass_explain; add it to the repo once the user says yes.
 - Production numbers (sessions affected, which pages, which diagnoses): genclass_analytics {source:"production"}.
-- No connected page in genclass_status: genclass_setup shows the dev-only lines to add.
-- Before calling a page or UI change done, after CSS or layout changes, or to audit a site you do not own: genclass_scan {url} loads it headless and lists unreadable text, broken images and fonts, sideways scrolling, covered controls, each with its element and a suggested fix.
+- No connected page in genclass_status: genclass_setup prints an install line and the dev-only lines; show them to the user and wait for a yes before you run or add them.
+- Before calling a page or UI change done, after CSS or layout changes, or to audit a site you do not own: genclass_scan {url} loads it headless and lists unreadable text, broken images and fonts, sideways scrolling, covered controls, each with its element and a suggested fix. Wait for a yes before npx playwright install chromium or npm i -D playwright, and before hosted: true, which sends the URL to the genclass.dev page check.
 
 The genclass skill holds the full procedure (the explore arguments, how to run the scenario, how to read a report, what to say when done): load it when this client has it.
 
@@ -2323,12 +2748,12 @@ var TOOLS = [
   {
     name: "genclass_explore",
     title: "Explore response orders",
-    description: 'Find races before users do. action "start" arms the next page loads: 2 baselines with responses in request order, then `runs` loads where overlapping responses arrive in a seeded different order (optionally slower, or with `focus` endpoints last). Run the same scenario once per armed load, then action "report": each load\'s final state is compared with the baseline; a difference in what the page shows, its form values, the requests it sent or its errors depends on network timing (a race), and comes with a seed that replays it. Store values that differ while the page is the same are listed apart as internal state. Without `route`, the page of the first armed load is the page under test; set `route` when the scenario loads several pages. Armed loads expire after 30 minutes. "stop" disarms.',
+    description: 'Find races before users do. action "start" arms the next page loads: 2 baselines with responses in request order (with `slow_ms`, a third with no added delay), then `runs` loads where overlapping responses arrive in a seeded different order (optionally slower, or with `focus` endpoints last). Run the same scenario once per armed load, then action "report": each load\'s final state is compared with the baseline; a difference in what the page shows, its form values, the requests it sent or its errors depends on network timing (a race), and comes with a seed that replays it. Store values that differ while the page is the same are listed apart as internal state. Without `route`, the page of the first armed load is the page under test; set `route` when the scenario loads several pages. Armed loads expire after 30 minutes. "stop" disarms.',
     inputSchema: {
       type: "object",
       properties: {
         action: { type: "string", enum: ["start", "report", "stop"] },
-        runs: { type: "number", description: "Seeded loads after the 2 baselines (default 6, max 50)." },
+        runs: { type: "number", description: "Seeded loads after the baselines (default 6, max 50)." },
         route: { type: "string", description: "Only arm page loads of this path (default: any page)." },
         focus: { type: "array", items: { type: "string" }, description: 'Request signatures to deliver last, e.g. ["PUT /api/notes/:id"] (one production flagged).' },
         slow_ms: { type: "number", description: "Also add up to this much latency per response (a slow network), e.g. 800." },
@@ -2366,7 +2791,7 @@ var TOOLS = [
   {
     name: "genclass_setup",
     title: "Set up GenClass",
-    description: "The lines to add so this project's dev build connects to GenClass (detects Vite, Next.js and others from package.json), how to check it works, and this MCP client's config lines for keeping the server configured. It changes no file.",
+    description: "The lines to add so this project's dev build connects to GenClass (detects Vite, Next.js and others from package.json), how to check it works, and this MCP client's config lines for keeping the server configured. It changes no file; show the user the lines and wait for a yes before you run or add them.",
     inputSchema: { type: "object", properties: {}, additionalProperties: false },
     annotations: { title: "Set up GenClass", readOnlyHint: true, destructiveHint: false, openWorldHint: false }
   },
@@ -2379,7 +2804,7 @@ var TOOLS = [
       properties: {
         url: { type: "string", description: "The page, e.g. http://localhost:5173/pricing or https://example.com." },
         phone: { type: "boolean", description: "The phone size only (default: desktop and phone)." },
-        hosted: { type: "boolean", description: "Run on the genclass.dev page check instead of this machine (public pages only; adds accessibility, speed and security)." }
+        hosted: { type: "boolean", description: "Run on the genclass.dev page check instead of this machine (public pages only; adds accessibility, speed and security). It sends the URL there, so ask the user first." }
       },
       required: ["url"],
       additionalProperties: false
@@ -2488,6 +2913,7 @@ async function callTool(name, args2, ctx) {
             `Explore ${x.id} armed: the next ${x.plan.length} page loads ${x.route ? `of ${q(x.route, 80)}` : "of the page the first one loads (later loads of other pages and tabs are left alone)"} get these delivery schedules, in order:`,
             ...x.plan.map((s, i) => `  ${i + 1}. ${clean(s.label, 80)}`),
             "",
+            ...x.plan.some((s) => s.delay) ? ["A difference between the slow baselines and the one without added delay is what a slow response alone does: the report names it."] : [],
             `Now run the same scenario ${x.plan.length} times, one page load each (reload or navigate fresh every time): load the page, do the user steps, then wait for \`await page.evaluate(() => window.__GENCLASS_AGENT__.whenSettled(15000))\`.`,
             `With Playwright: \`npx playwright test <spec> --repeat-each ${x.plan.length} --workers 1\`. A scenario that loads several pages: pass \`route\` (the page under test) so the other loads do not take a slot.`,
             `Then: genclass_explore {action:"report", id:"${x.id}"}.`
@@ -2505,19 +2931,30 @@ async function callTool(name, args2, ctx) {
         const s = r.session;
         out.push(`Explore ${s.id}: ${s.runs.length} of ${s.plan.length} planned loads recorded (${r.runs.filter((x) => x.settled).length} reached a quiet point).`);
         if (s.runs.length < s.plan.length) out.push(`Missing ${s.plan.length - s.runs.length} load(s): run the scenario again for the rest, or report now with what there is.`);
-        if (!r.groups.length) out.push("No run reached a quiet point yet: wait for whenSettled() after the steps.");
+        if (!r.groups.length) out.push("NO VERDICT: no run reached a quiet point yet, so nothing was compared and this report says nothing about races on this page, either way. Wait for whenSettled() after the steps.");
         const seededRuns = r.runs.filter((x) => x.settled && x.schedule?.order !== "fifo").length;
-        const compared = r.groups.reduce((n, g) => n + (g.compared ?? 0), 0);
+        const compared = r.groups.reduce((n, g) => n + g.compared, 0);
         if (r.groups.length) {
-          const how = r.groups[0].grouping === "kinds" ? " (grouped by action kinds only: the recorded element names and roles differed between loads)" : r.groups[0].grouping === "roles" ? " (grouped by action kinds and element roles: the recorded element names differed between loads)" : "";
+          const level = r.groups[0].grouping;
+          const how = level === "optional" ? " (grouped by action kinds, leaving out up to two actions only some loads did: the recorded steps differed between loads)" : level === "kinds" ? " (grouped by action kinds only: the recorded element names and roles differed between loads)" : level === "roles" ? " (grouped by action kinds and element roles: the recorded element names differed between loads)" : "";
           out.push(`Compared: ${compared} of ${seededRuns} reordered run(s) against two baselines${how}.`);
+          if (!compared && r.groups.some((g) => g.delay)) out.push("No verdict on reordering: no reordered run was compared. What the baselines alone show is below.");
+          else if (!compared) out.push("NO VERDICT: nothing was compared, so this report says nothing about races on this page, either way. It is not a clean result. The per-scenario notes below say why; run the missing loads, or the same steps in every load.");
         }
-        const diffLines = (d) => {
-          out.push(`- run ${d.run} (${clean(d.label, 60)})${d.forced ? ` (${d.forced} hold(s) ran out)` : ""}:`);
-          if (d.textOnlyBaseline.length) out.push(`    page text only in the baseline: ${d.textOnlyBaseline.slice(0, 4).map((l) => q(l, 80)).join(", ")}`);
-          if (d.textOnlyRun.length) out.push(`    page text only in this run: ${d.textOnlyRun.slice(0, 4).map((l) => q(l, 80)).join(", ")}`);
-          for (const x of d.fields.slice(0, 6)) out.push(`    ${x.where === "requests" ? "requests sent to" : x.where} ${q(x.name, 80)}: baseline ${q(x.baseline, 80)}, this run ${q(x.run, 80)}`);
+        const postCount = (ds) => ds.some((d) => d.tier === "internal" && d.fields.some((f) => f.where === "requests" && /^POST\s/.test(f.name)));
+        const diffLines = (d, label = `run ${d.run} (${clean(d.label, 60)})`, base = "the baseline", self = "this run", baseValue = "baseline") => {
+          out.push(`- ${label}${d.forced ? ` (${d.forced} hold(s) ran out)` : ""}:`);
+          if (d.textOnlyBaseline.length) out.push(`    page text only in ${base}: ${d.textOnlyBaseline.slice(0, 4).map((l) => q(l, 80)).join(", ")}${d.textOnlyBaseline.length > 4 ? `, and ${d.textOnlyBaseline.length - 4} more` : ""}`);
+          if (d.textOnlyRun.length) out.push(`    page text only in ${self}: ${d.textOnlyRun.slice(0, 4).map((l) => q(l, 80)).join(", ")}${d.textOnlyRun.length > 4 ? `, and ${d.textOnlyRun.length - 4} more` : ""}`);
+          const fieldLine = (x) => out.push(`    ${x.where === "requests" ? "requests sent to" : x.where} ${q(x.name, 80)}: ${baseValue} ${q(x.baseline, 80)}, ${self} ${q(x.run, 80)}${x.evidence ? ` (${clean(x.evidence, 80)})` : ""}`);
+          const shownFields = d.fields.filter(shownField);
+          const rest = d.fields.filter((x) => !shownField(x));
+          const room = shownFields.length || d.textOnlyBaseline.length || d.textOnlyRun.length ? 2 : 6;
+          for (const x of shownFields.slice(0, 6)) fieldLine(x);
+          for (const x of rest.slice(0, room)) fieldLine(x);
+          if (rest.length > room) out.push(`    and ${rest.length - room} more store value(s) or request count(s) that differ (internal: genclass_explain lists them on a finding)`);
           if (d.announced?.length) out.push(`    announcements (status, alert regions) only in one of them: ${d.announced.slice(0, 3).map((l) => q(l, 80)).join(", ")}`);
+          if (d.otherSite) out.push("    (the page differs only in a bare count, which stands for a store field the one response from another site wrote: that site answered differently)");
           for (const e of d.errors.slice(0, 3)) out.push(`    error only here: ${q(e, 120)}`);
           for (const w of d.witnesses.slice(0, 3)) out.push(`    witness only here: ${clean(w, 160)}`);
         };
@@ -2525,28 +2962,46 @@ async function callTool(name, args2, ctx) {
           out.push("", `## ${clean(g.route, 80)} \xB7 ${g.runs} run(s) \xB7 scenario ${PAGE_DATA}:`, ...g.scenario ? g.scenario.split("\n").map((l) => `  ${clean(l, 160)}`) : ["  (no user actions: a page load)"]);
           if (g.truncated) out.push(`Snapshots of ${g.truncated.runs} run(s) left store fields out (up to ${g.truncated.left} of ${g.truncated.total}; registered and component state first, then discovered stores, shallowest first): a field missing there was not compared.`);
           if (g.missingBaseline) {
-            out.push("No baseline run in this group (the first two armed loads are the baselines): nothing to compare with.");
+            out.push(g.plainBaseline && g.runs === 1 ? "This is the load with no added delay, and it recorded other user actions than the slow baselines, so it was not compared with them." : "No baseline run in this group (the first two armed loads are the baselines): nothing to compare with.");
             continue;
           }
           if (g.insufficientBaselines) {
-            out.push(`Only one baseline in this group (another page load took the other baseline slot), so noise (clocks, ids) cannot be told from a race: no verdict. ${g.unfiltered.length} run(s) differed unfiltered. Run genclass_explore again with \`route\` set to this page.`);
+            out.push(`Only one baseline in this group (another page load took the other baseline slot, or the other baseline recorded other user actions), so noise (clocks, ids) cannot be told from a race: no verdict. ${g.unfiltered.length} run(s) differed unfiltered. Run genclass_explore again with \`route\` set to this page, doing the same steps in every load.`);
             continue;
           }
-          if (g.noise.length) out.push(`Ignored as noise (differs between the two baselines): ${g.noise.slice(0, 8).map((n) => clean(n, 60)).join(", ")}`);
-          const seeded = g.compared ?? g.runs - g.baselines.length;
+          if (g.noise.length) out.push(`Ignored as noise (differs between the two baselines): ${g.noise.slice(0, 8).map((n) => clean(n, 60)).join(", ")}${g.noise.length > 8 ? `, and ${g.noise.length - 8} more` : ""}`);
+          if (g.thirdParty?.length) out.push(`Left out of the request counts (other sites, and nothing the user did or this page's own origin asked for led to them): ${g.thirdParty.slice(0, 4).map((n) => q(n, 60)).join(", ")}`);
+          const seeded = g.compared;
+          const noDelay = "the run with no added delay";
+          if (g.delay) {
+            const said = `${nameDifference(g.delay).replace(/the baseline/g, noDelay)}.`;
+            if (g.delay.oneLoad) out.push(`RACE, on one load's word: ${g.delay.differing} of ${g.delay.of} slow baselines${g.compared ? " and every reordered run" : ""} ended the same way, and only the one load with no added delay differs: ${said} Either a slow response does this, or that load was the odd one out (an error page, a failed request): load the page once more with no added delay before believing it.`);
+            else out.push(`RACE: a slow response alone changes the page, no reordering needed: ${g.delay.differing} of ${g.delay.of} slow baselines ended the same way, differently from the baseline with no added delay: ${said}`);
+            diffLines(g.delay, `${clean(g.delay.label, 60)}, run ${g.delay.run}, against the baseline with no added delay`, noDelay, "the slow baselines", "no added delay");
+          }
           if (!seeded) {
             out.push(seededRuns ? "No verdict: 0 reordered runs were compared in this group (the reordered loads recorded other user actions: see the other groups)." : "No verdict: 0 reordered runs were compared (none has reached a quiet point after its steps yet: run the scenario for the remaining armed loads).");
             continue;
           }
-          const tierOf = (d) => d.tier ?? (d.fields.length || d.textOnlyBaseline.length || d.textOnlyRun.length || d.errors.length ? "visible" : "transient");
-          const races = g.diffs.filter((d) => tierOf(d) === "visible");
-          const internal = g.diffs.filter((d) => tierOf(d) === "internal");
-          const along = g.diffs.filter((d) => tierOf(d) === "transient");
-          if (races.length) out.push(`RACE: ${races.length} of ${seeded} reordered run(s) ended in a different state than the baseline (responses in request order): what the page shows, its form values, the writes it sent or its errors differ.`);
-          else out.push(`No race found: none of the ${seeded} compared reordered run(s) ended with a different page, form values, writes or errors than the baseline.`);
+          const races = strongestFirst(g.diffs.filter((d) => d.tier === "visible"));
+          const internal = g.diffs.filter((d) => d.tier === "internal");
+          const along = g.diffs.filter((d) => d.tier === "transient");
+          if (g.delay && !races.length) out.push(`No more than that: none of the ${seeded} reordered run(s) ended differently from both the slow baselines and ${noDelay}.`);
+          if (races.length) out.push(`RACE: ${races.length} of ${seeded} reordered run(s) ended in a different state than the baseline (responses in request order): under ${clean(races[0].label, 60)} ${nameDifference(races[0])}.`);
+          else if (!g.delay) out.push(`No race found: none of the ${seeded} compared reordered run(s) ended with a different page, form values or errors than the baseline, or sent a write the baseline never sent or left one out.${postCount(g.diffs) ? " A POST was sent a different number of times, listed below: if it changes anything, a duplicate write may have happened with the page unchanged, so check what the server holds." : ""}`);
           for (const d of races.slice(0, 6)) diffLines(d);
+          if (g.look) {
+            const says = [
+              ...g.look.lines.map((l) => `${q(l.text, 80)} ${l.only === "slow" ? "only in one slow baseline" : l.only === "plain" ? "in the run with no added delay and only one slow baseline" : "only in the run with no added delay"}${l.runs ? `, and in ${l.runs} of ${seeded} reordered run(s)` : ""}`),
+              ...g.look.drift.map(([slow, plain]) => `${q(slow, 80)} with added latency, ${q(plain, 80)} with no added delay`),
+              ...g.look.errors.map((e) => `the error ${q(e, 100)} in only one slow baseline`),
+              ...g.look.fields.map((f) => `${f.where === "requests" ? "requests sent to" : "form field"} ${q(f.name, 60)}: ${q(f.run, 40)} in one slow baseline, ${q(f.baseline, 40)} in the run with no added delay`),
+              ...g.look.writes.map((f) => `${q(f.name, 60)} ${clean(f.run, 10)} time(s) with added latency, ${clean(f.baseline, 10)} with no added delay`)
+            ];
+            out.push(`Not a race by this check, but worth a look (it rests on one load against one load, a number a little off, or a count of writes alone, and chance, a counter or a save queue can do that): ${says.join("; ")}. If it is a bug it hides here: check the page${g.look.writes.length || g.look.fields.some((f) => f.where === "requests") ? ", and for the writes, what the server holds: a duplicate or lost write may have happened with the page unchanged" : ""}.`);
+          }
           if (internal.length) {
-            out.push(`Internal state only (not a race by this check): ${internal.length} of ${seeded} ended with store values, counts of GET requests (a cache refetching once more) or announcements (a toast a slower run let expire) that differ from the baseline while the page showed the same. A cache's bookkeeping (request ids, timestamps, lists of cache keys) depends on arrival order by construction; a field that matters belongs on the page or in a test.`);
+            out.push(`Internal state only (not a race by this check): ${internal.length} of ${seeded} ended with store values, counts of GET requests (a cache refetching once more), a different non-zero count of a POST with nothing recorded that makes it a write, or announcements (a toast a slower run let expire) that differ from the baseline while the page showed the same. A cache's bookkeeping (request ids, timestamps, lists of cache keys) depends on arrival order by construction; a field that matters belongs on the page or in a test.`);
             for (const d of internal.slice(0, 3)) diffLines(d);
           }
           if (along.length) {
@@ -2554,7 +3009,7 @@ async function callTool(name, args2, ctx) {
             for (const d of along.slice(0, 3)) diffLines(d);
           }
         }
-        if (r.findings.length) out.push("", `Race finding(s): ${r.findings.map((f) => f.id).join(", ")}. Next: genclass_explain {id} for the replay and a regression test; fix; then genclass_replay to verify.`);
+        if (r.findings.length) out.push("", `Race finding(s): ${r.findings.map((f) => f.id).join(", ")}. Next: genclass_explain {id} for the replay and a regression test. If the user asked for a fix: fix it, then genclass_replay to verify.`);
         return { text: out.join("\n") };
       }
       return { text: "action must be start, report or stop", isError: true };
@@ -2596,7 +3051,9 @@ async function callTool(name, args2, ctx) {
       return { text: out.join("\n").trim() };
     }
     case "genclass_setup":
-      return { text: setupText(ctx.cwd, ctx.client) };
+      return { text: `This changed nothing. Show the user the lines below and wait for a yes before you run or add any of them.
+
+${setupText(ctx.cwd, ctx.client)}` };
     case "genclass_scan":
       return runScan(args2, ctx.cwd, ctx.run);
     case "genclass_clear": {
@@ -2624,7 +3081,8 @@ function evidenceLines(f, ev) {
       if (typeof ev.stack === "string") out.push("- Stack:", ...cleanBlock(ev.stack, 12, 200).map((l) => `    ${l}`));
       break;
     case "race": {
-      out.push(`- Explore ${s("session", 10)}: ${ev.failingRuns?.length ?? 1} of ${s("of", 6)} reordered run(s) ended differently from the baseline (responses in request order).`);
+      if (ev.delayOnly) out.push(`- Explore ${s("session", 10)}: ${s("differing", 6)} of ${s("of", 6)} slow baselines ended differently from the baseline with no added delay (a slow response alone, no reordering; below, "baseline" is the run with no added delay).`);
+      else out.push(`- Explore ${s("session", 10)}: ${ev.failingRuns?.length ?? 1} of ${s("of", 6)} reordered run(s) ended differently from the baseline (responses in request order).`);
       for (const x of (ev.fields ?? []).slice(0, 8)) out.push(`- ${x.where === "requests" ? "requests sent to" : x.where} ${q(x.name, 80)}: baseline ${q(x.baseline, 80)}, failing run ${q(x.run, 80)}`);
       for (const l of (ev.textOnlyBaseline ?? []).slice(0, 4)) out.push(`- page text in the baseline only: ${q(l, 100)}`);
       for (const l of (ev.textOnlyRun ?? []).slice(0, 4)) out.push(`- page text in the failing run only: ${q(l, 100)}`);
@@ -2706,19 +3164,21 @@ function setupText(cwd, client) {
   const guard = next ? `process.env.NODE_ENV === "development"` : vite ? "import.meta.env.DEV" : `process.env.NODE_ENV !== "production"`;
   const where = next ? 'a client component loaded once from the root layout ("use client")' : vite ? "the app's entry (src/main.tsx or src/main.ts), before the app renders" : "the app's browser entry, before the app starts";
   const lines = [
-    installed ? "@genclass/runtime is installed." : `1. Install the newest runtime, 0.3.0-beta.1 or later (the agent entry and analytics; 0.2.x has neither${has("@genclass/runtime") ? `; this project has ${JSON.stringify(range)}${have !== range ? `, installed ${have}` : ""}` : ""}): npm install @genclass/runtime@beta`,
+    installed ? "@genclass/runtime is installed." : `1. Install the newest runtime line (npm tag beta) at the exact version this server was tested with; the agent entry and analytics need 0.3.0-beta.1 or later, and 0.2.x, npm's latest, has neither${has("@genclass/runtime") ? `; this project has ${JSON.stringify(range)}${have !== range ? `, installed ${have}` : ""}` : ""}: npm install ${pinnedRuntime()}`,
     `${installed ? "1" : "2"}. In ${where}:`,
     "```ts",
     `import { GenClass } from "@genclass/runtime";`,
     `import { connectAgent } from "@genclass/runtime/agent";`,
     ``,
-    `const rt = GenClass.init();`,
-    `// development builds only: the link records and schedules nothing in production (and is tree-shaken out)`,
-    `if (${guard}) connectAgent(rt);`,
+    `// development builds only: a production build drops all of this, so no visitor runs GenClass`,
+    `if (${guard}) {`,
+    `  const rt = GenClass.init();`,
+    `  connectAgent(rt);`,
+    `}`,
     "```",
     `${installed ? "2" : "3"}. Load a page of the dev server, then genclass_status: it should list the page as active.`,
     "",
-    "Notes: connectAgent runs only on pages served from this machine (localhost, 127.0.0.1, *.localhost); for a *.test or *.local name or a LAN address use connectAgent(rt, { anyHost: true }) and allow the origin with GENCLASS_AGENT_ORIGINS=http://host:port in the MCP server's environment. It talks only to this machine's bridge (http://127.0.0.1:47357; GENCLASS_AGENT_PORT changes it, and the page then needs connectAgent(rt, { url })). A Content-Security-Policy in development needs connect-src http://127.0.0.1:47357; a mock service worker (MSW) should let 127.0.0.1:47357 through. Production: GenClass.init() alone, unchanged."
+    "Notes: connectAgent runs only on pages served from this machine (localhost, 127.0.0.1, *.localhost); for a *.test or *.local name or a LAN address use connectAgent(rt, { anyHost: true }) and allow the origin with GENCLASS_AGENT_ORIGINS=http://host:port in the MCP server's environment. It talks only to this machine's bridge (http://127.0.0.1:47357; GENCLASS_AGENT_PORT changes it, and the page then needs connectAgent(rt, { url })). A Content-Security-Policy in development needs connect-src http://127.0.0.1:47357; a mock service worker (MSW) should let 127.0.0.1:47357 through. On a local or private address the runtime sends no diagnostics. Production is a separate choice none of this needs: GenClass.init() outside the check runs for every visitor and sends anonymous diagnostics from public hosts by default (GenClass.init({ telemetry: false }) turns them off), so do not move it there without asking. An app that already starts GenClass keeps that setup: GenClass.init() returns the running runtime."
   ];
   const c = clientFor(client);
   if (c) lines.push("", `To keep GenClass configured in ${c.label} (in the project where the client reads a project file):`, "", c.block(VERSION));
